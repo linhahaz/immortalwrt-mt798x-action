@@ -1,96 +1,103 @@
-name: Build ImmortalWrt for MT7981
+name: Build OpenWrt
 
 on:
   workflow_dispatch:
     inputs:
       ssh:
-        description: 'Enable SSH debugging'
+        description: 'SSH connection to Actions'
         required: false
         default: 'false'
 
 env:
   REPO_URL: https://github.com/padavanonly/immortalwrt-mt798x-24.10
   REPO_BRANCH: 2410
-  TARGET: mediatek/mt7981
-  DEVICE: abt_asr3000
+  FEEDS_CONF: feeds.conf.default
+  CONFIG_FILE: .config
+  DIY_P1_SH: diy-part1.sh
+  DIY_P2_SH: diy-part2.sh
+  UPLOAD_BIN_DIR: false
+  UPLOAD_FIRMWARE: true
   TZ: Asia/Shanghai
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
-    timeout-minutes: 180
+    runs-on: ubuntu-20.04
 
     steps:
-    - name: Checkout repository
+    - name: Clean Environment
+      run: |
+        sudo rm -rf ~/.npm ~/.cache ~/.cargo
+        sudo rm -rf /home/runner/work/_actions
+
+    - name: Checkout Source Code
       uses: actions/checkout@v4
 
-    - name: Setup build environment
+    - name: Download Upload Artifact Manually
       run: |
-        sudo apt-get -qq update
-        sudo apt-get -qq install \
-          build-essential ccache clang flex g++ gawk gcc-multilib gettext git \
-          libncurses5-dev libssl-dev libtool-bin python3 python3-distutils \
-          rsync unzip zlib1g-dev file wget curl jq
+        git clone https://github.com/actions/upload-artifact.git
+        cd upload-artifact
+        git checkout v3.2.0
+
+    - name: Set up Environment
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends \
+          build-essential ccache curl git unzip wget \
+          python3 python3-pip rsync libncurses5-dev zlib1g-dev gawk \
+          gettext openssl libssl-dev xsltproc time \
+          python3-distutils python3-setuptools
         sudo timedatectl set-timezone "$TZ"
 
-    - name: Clone source code
+    - name: Clone OpenWrt Source
       run: |
-        git clone --depth=1 $REPO_URL -b $REPO_BRANCH openwrt
-        cd openwrt
-        echo "src-git packages https://git.openwrt.org/feed/packages.git" >> feeds.conf.default
-        echo "src-git luci https://git.openwrt.org/project/luci.git" >> feeds.conf.default
+        git clone --depth 1 $REPO_URL -b $REPO_BRANCH openwrt
+        ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
 
-    - name: Update feeds
+    - name: Load Custom Feeds
       run: |
+        [ -e $FEEDS_CONF ] && mv $FEEDS_CONF openwrt/feeds.conf.default
+        chmod +x $DIY_P1_SH
         cd openwrt
-        ./scripts/feeds update -a
-        ./scripts/feeds install -a
+        $GITHUB_WORKSPACE/$DIY_P1_SH
 
-    - name: Apply default configuration
+    - name: Update Feeds
+      run: cd openwrt && ./scripts/feeds update -a
+
+    - name: Install Feeds
+      run: cd openwrt && ./scripts/feeds install -a
+
+    - name: Load Custom Configuration
+      run: |
+        [ -e files ] && mv files openwrt/files
+        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
+        chmod +x $DIY_P2_SH
+        cd openwrt
+        $GITHUB_WORKSPACE/$DIY_P2_SH
+
+    - name: Download Packages
       run: |
         cd openwrt
-        cat > .config <<'EOF'
-CONFIG_TARGET_mediatek=y
-CONFIG_TARGET_mediatek_mt7981=y
-CONFIG_TARGET_DEVICE_mediatek_mt7981_DEVICE_abt_asr3000=y
-CONFIG_LINUX_5_4=y
-CONFIG_PACKAGE_luci-theme-argon=y
-CONFIG_PACKAGE_luci-app-homeproxy=y
-CONFIG_MTK_HNAT_V3=y
-CONFIG_PACKAGE_openssh-sftp-server=y
-CONFIG_PACKAGE_htop=y
-CONFIG_PACKAGE_tcpdump=y
-EOF
         make defconfig
+        make download -j$(nproc)
+        find dl -size -1024c -exec rm -f {} \;
 
-    - name: SSH debug (optional)
-      uses: mxschmitt/action-tmate@v3
-      if: inputs.ssh == 'true'
-
-    - name: Download packages
+    - name: Compile Firmware
       run: |
         cd openwrt
-        make -j$(($(nproc) + 1)) download
-        find dl -size -1024c -delete
+        make -j$(nproc) || make -j1 V=s
+        DEVICE_NAME=$(grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/')
+        echo "DEVICE_NAME=_${DEVICE_NAME}" >> $GITHUB_ENV
+        echo "FILE_DATE=_$(date +%Y%m%d%H%M)" >> $GITHUB_ENV
 
-    - name: Build firmware
+    - name: Upload Bin Directory
       run: |
-        cd openwrt
-        make -j$(($(nproc) + 1)) || make -j1 V=s
-        echo "firmware_path=bin/targets/$TARGET" >> $GITHUB_OUTPUT
+        cd upload-artifact
+        node dist/index.js --name OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }} --path openwrt/bin
 
-    - name: Upload firmware
-      uses: actions/upload-artifact@v4
-      with:
-        name: immortalwrt-$DEVICE-$(date +%Y%m%d)
-        path: openwrt/bin/targets/$TARGET/*.bin
-        if-no-files-found: error
-        retention-days: 7
-
-    - name: Create release
-      uses: softprops/action-gh-release@v2
-      if: success()
-      with:
-        tag_name: build-$(date +%Y%m%d-%H%M)
-        files: openwrt/bin/targets/$TARGET/*.bin
-        generate_release_notes: true
+    - name: Organize Files
+      run: |
+        cd openwrt/bin/targets/*/*
+        rm -rf packages
+        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
