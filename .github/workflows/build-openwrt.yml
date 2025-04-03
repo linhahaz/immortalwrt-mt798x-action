@@ -27,6 +27,10 @@ jobs:
     runs-on: ubuntu-20.04
 
     steps:
+    - name: Clean Cache
+      run: |
+        rm -rf ~/.npm ~/.cache ~/.cargo
+
     - name: Checkout Source Code
       uses: actions/checkout@v4
 
@@ -91,7 +95,7 @@ jobs:
       run: df -hT
 
     - name: Upload Bin Directory
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v3.2.0
       if: env.UPLOAD_BIN_DIR == 'true'
       with:
         name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
@@ -104,37 +108,11 @@ jobs:
         echo "FIRMWARE=$PWD" >> $GITHUB_ENV
 
     - name: Upload Firmware Directory
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v3.2.0
       if: env.UPLOAD_FIRMWARE == 'true'
       with:
         name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
         path: ${{ env.FIRMWARE }}
-
-    - name: Upload to CowTransfer
-      if: env.UPLOAD_COWTRANSFER == 'true'
-      run: |
-        curl -fsSL git.io/file-transfer | sh
-        ./transfer cow ${FIRMWARE}
-
-    - name: Upload to WeTransfer
-      if: env.UPLOAD_WETRANSFER == 'true'
-      run: |
-        curl -fsSL git.io/file-transfer | sh
-        ./transfer wet ${FIRMWARE}
-
-    - name: Generate Release Tag
-      if: env.UPLOAD_RELEASE == 'true'
-      run: |
-        echo "release_tag=$(date +'%Y.%m.%d-%H%M')" >> $GITHUB_ENV
-
-    - name: Upload to GitHub Release
-      uses: softprops/action-gh-release@v1
-      if: env.UPLOAD_RELEASE == 'true'
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        tag_name: ${{ env.release_tag }}
-        files: ${{ env.FIRMWARE }}/*
 
     - name: Configure GitHub Pages
       uses: actions/configure-pages@v4
