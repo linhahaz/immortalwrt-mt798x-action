@@ -1,138 +1,96 @@
-name: Build OpenWrt
+name: Build ImmortalWrt for MT7981
 
 on:
   workflow_dispatch:
     inputs:
       ssh:
-        description: 'SSH connection to Actions'
+        description: 'Enable SSH debugging'
         required: false
         default: 'false'
 
 env:
   REPO_URL: https://github.com/padavanonly/immortalwrt-mt798x-24.10
   REPO_BRANCH: 2410
-  FEEDS_CONF: feeds.conf.default
-  CONFIG_FILE: .config
-  DIY_P1_SH: diy-part1.sh
-  DIY_P2_SH: diy-part2.sh
-  UPLOAD_BIN_DIR: false
-  UPLOAD_FIRMWARE: true
-  UPLOAD_COWTRANSFER: false
-  UPLOAD_WETRANSFER: false
-  UPLOAD_RELEASE: false
+  TARGET: mediatek/mt7981
+  DEVICE: abt_asr3000
   TZ: Asia/Shanghai
 
 jobs:
   build:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
 
     steps:
-    - name: Clean Cache
-      run: |
-        rm -rf ~/.npm ~/.cache ~/.cargo
-
-    - name: Checkout Source Code
+    - name: Checkout repository
       uses: actions/checkout@v4
 
-    - name: Set up Environment
-      env:
-        DEBIAN_FRONTEND: noninteractive
+    - name: Setup build environment
       run: |
-        sudo apt-get update -qq
-        sudo apt-get install -y --no-install-recommends \
-          build-essential ccache curl git unzip wget \
-          python3 python3-pip rsync libncurses5-dev zlib1g-dev gawk \
-          gettext openssl libssl-dev xsltproc time \
-          python3-distutils python3-setuptools
+        sudo apt-get -qq update
+        sudo apt-get -qq install \
+          build-essential ccache clang flex g++ gawk gcc-multilib gettext git \
+          libncurses5-dev libssl-dev libtool-bin python3 python3-distutils \
+          rsync unzip zlib1g-dev file wget curl jq
         sudo timedatectl set-timezone "$TZ"
 
-    - name: Clone OpenWrt Source
+    - name: Clone source code
       run: |
-        git clone --depth 1 $REPO_URL -b $REPO_BRANCH openwrt
-        ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
-
-    - name: Load Custom Feeds
-      run: |
-        [ -e $FEEDS_CONF ] && mv $FEEDS_CONF openwrt/feeds.conf.default
-        chmod +x $DIY_P1_SH
+        git clone --depth=1 $REPO_URL -b $REPO_BRANCH openwrt
         cd openwrt
-        $GITHUB_WORKSPACE/$DIY_P1_SH
+        echo "src-git packages https://git.openwrt.org/feed/packages.git" >> feeds.conf.default
+        echo "src-git luci https://git.openwrt.org/project/luci.git" >> feeds.conf.default
 
-    - name: Update Feeds
-      run: cd openwrt && ./scripts/feeds update -a
-
-    - name: Install Feeds
-      run: cd openwrt && ./scripts/feeds install -a
-
-    - name: Load Custom Configuration
-      run: |
-        [ -e files ] && mv files openwrt/files
-        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
-        chmod +x $DIY_P2_SH
-        cd openwrt
-        $GITHUB_WORKSPACE/$DIY_P2_SH
-
-    - name: Download Packages
+    - name: Update feeds
       run: |
         cd openwrt
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+
+    - name: Apply default configuration
+      run: |
+        cd openwrt
+        cat > .config <<'EOF'
+CONFIG_TARGET_mediatek=y
+CONFIG_TARGET_mediatek_mt7981=y
+CONFIG_TARGET_DEVICE_mediatek_mt7981_DEVICE_abt_asr3000=y
+CONFIG_LINUX_5_4=y
+CONFIG_PACKAGE_luci-theme-argon=y
+CONFIG_PACKAGE_luci-app-homeproxy=y
+CONFIG_MTK_HNAT_V3=y
+CONFIG_PACKAGE_openssh-sftp-server=y
+CONFIG_PACKAGE_htop=y
+CONFIG_PACKAGE_tcpdump=y
+EOF
         make defconfig
-        make download -j$(nproc)
-        find dl -size -1024c -exec rm -f {} \;
 
-    - name: Compile Firmware
+    - name: SSH debug (optional)
+      uses: mxschmitt/action-tmate@v3
+      if: inputs.ssh == 'true'
+
+    - name: Download packages
       run: |
         cd openwrt
-        make -j$(nproc) || make -j1 V=s
-        DEVICE_NAME=$(grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/')
-        if [[ -z "$DEVICE_NAME" ]]; then
-          echo "DEVICE_NAME=unknown" >> $GITHUB_ENV
-        else
-          echo "DEVICE_NAME=_${DEVICE_NAME}" >> $GITHUB_ENV
-        fi
-        echo "FILE_DATE=_$(date +%Y%m%d%H%M)" >> $GITHUB_ENV
+        make -j$(($(nproc) + 1)) download
+        find dl -size -1024c -delete
 
-    - name: Check Disk Space
-      run: df -hT
-
-    - name: Upload Bin Directory
-      uses: actions/upload-artifact@v3.2.0
-      if: env.UPLOAD_BIN_DIR == 'true'
-      with:
-        name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
-        path: openwrt/bin
-
-    - name: Organize Files
+    - name: Build firmware
       run: |
-        cd openwrt/bin/targets/*/*
-        rm -rf packages
-        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+        cd openwrt
+        make -j$(($(nproc) + 1)) || make -j1 V=s
+        echo "firmware_path=bin/targets/$TARGET" >> $GITHUB_OUTPUT
 
-    - name: Upload Firmware Directory
-      uses: actions/upload-artifact@v3.2.0
-      if: env.UPLOAD_FIRMWARE == 'true'
+    - name: Upload firmware
+      uses: actions/upload-artifact@v4
       with:
-        name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
-        path: ${{ env.FIRMWARE }}
+        name: immortalwrt-$DEVICE-$(date +%Y%m%d)
+        path: openwrt/bin/targets/$TARGET/*.bin
+        if-no-files-found: error
+        retention-days: 7
 
-    - name: Configure GitHub Pages
-      uses: actions/configure-pages@v4
-
-    - name: Upload Pages Artifact
-      uses: actions/upload-pages-artifact@v3
+    - name: Create release
+      uses: softprops/action-gh-release@v2
+      if: success()
       with:
-        path: openwrt/bin
-
-    - name: Clean Old Workflow Runs
-      uses: GitRML/delete-workflow-runs@main
-      with:
-        retain_days: 1
-        keep_minimum_runs: 3
-
-    - name: Clean Old Releases
-      uses: dev-drprasad/delete-older-releases@v0.1.0
-      if: env.UPLOAD_RELEASE == 'true'
-      with:
-        keep_latest: 3
-        delete_tags: true
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        tag_name: build-$(date +%Y%m%d-%H%M)
+        files: openwrt/bin/targets/$TARGET/*.bin
+        generate_release_notes: true
